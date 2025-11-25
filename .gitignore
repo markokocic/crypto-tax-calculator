@@ -1,0 +1,10 @@
+# Binaries
+/bin/
+/vendor/
+/*.exe
+/*.exe~
+/*.dll
+/*.so
+/*.dylib
+.aider*
+test_kraken.csv

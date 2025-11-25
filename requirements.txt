@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: EPL-2.0
+# Copyright (c) 2025-present Marko Kocić <marko@euptera.com>
+
+# Crypto Tax Calculator — Requirements (updated)
+#
+# This file records the up-to-date requirements and known limitations for the
+# single-file Go crypto tax calculator (main.go). It reflects the current
+# implementation and notes remaining work / recommended improvements.
+
+## Technical
+- Use Go (module mode). Current go.mod: go 1.25.3.
+- Prefer standard library where possible; a small, well-tested decimal library is used for exact decimal arithmetic.
+- Core implementation must be contained in a single source file (main.go).
+- Provide a go.mod with the module name and Go toolchain version.
+
+## Dependencies
+- github.com/shopspring/decimal v1.3.0
+  - Used for exact decimal arithmetic for all monetary and amount calculations to avoid binary floating-point rounding errors.
+
+## Command-line interface
+- Accept multiple CSV input files as positional arguments.
+- Flags:
+  - -year YYYY         : restrict printed summary to a single tax year (0 = all years).
+  - -wallet W1,W2      : comma-separated wallet names to include (default: none = all).
+  - -commodity C1,C2   : comma-separated commodity symbols to include (default: none = all).
+  - -pricefile PATH    : (future/optional) CSV with historical prices to value income (asset,timestamp,price,currency).
+  - -v                 : verbose logging; when set, program prints the list of transactions that match provided filters and additional processing logs.
+- The -wallet flag values are trimmed and used both as default wallet names (if wallet column missing) and as an inclusion filter.
+
+## Parsing pass (per-file)
+- Read each CSV file, detect format via header heuristics (Kraken detected by presence of txid,time,type).
+- Parse rows into a standardized Tx model with fields:
+  - Wallet, Time, Type, Commodity, Currency, Amount, Cost, PricePerUnit, Fee, Raw map, SourceFile, ReferenceID, PairedComment.
+- Kraken support:
+  - Group rows by reference id (refid/txid). For each group:
+    - Detect fiat rows and crypto rows.
+    - Allocation rules:
+      - If group contains fiat + crypto rows, allocate fiat cost and fiat fees proportionally to crypto rows (decimal arithmetic).
+      - Detect "income" groups (types containing earn/reward/staking) and emit only the receiving positive crypto rows as type "income".
+      - Detect "transfer" groups when subtype contains "autoallocation"/"allocation" and synthesize a "transfer" Tx that moves amount from source wallet to destination wallet (preserve cost basis).
+  - Skip fiat-only rows (we do not track fiat as a commodity).
+  - Robustly handle missing fields (try multiple header keys).
+- Generic fallback:
+  - Parse common headers and skip fiat-only rows.
+- All parsed Tx must have a Time and Wallet determined (filename fallback if wallet not present).
+
+## Merging / sorting
+- After parsing all files, merge transaction slices and sort by time (oldest first).
+- Stable tie-breakers: SourceFile, ReferenceID.
+
+## Processing pass
+- Process transactions sequentially in chronological order.
+- Implement a handler dispatch (multimethod) map keyed by normalized Type (e.g. buy, sell, income, convert, transfer).
+- State:
+  - Inventories: map[wallet]map[commodity][]InventoryEntry
+    - InventoryEntry: Time, Amount (decimal), UnitCost (decimal), TotalCost (decimal), SourceFiles.
+    - Inventories for each wallet/commodity are kept FIFO-sorted by Time (oldest first).
+  - TaxYears: map[year]map[wallet]map[commodity]*Gains
+    - Gains: Short (decimal), Long (decimal), Income (decimal).
+  - Verbose flag and applied wallet/commodity filters stored in State for selective verbose logging.
+- Handlers:
+  - buy: add inventory entry (amount absolute) using Cost to compute unit cost; include fees in buy cost (decimal arithmetic).
+  - income: add inventory entry and add income = fair value at receipt (tx.Cost). If no cost available, Income will be zero (see limitations).
+  - sell: consume FIFO inventory from wallet/commodity, compute gain = proceeds - cost basis allocated FIFO; fees reduce proceeds; allocate gain to tax year based on holding period (>=365 days -> long). All arithmetic with decimal.Decimal.
+  - convert/trade: treated heuristically as buy or sell depending on sign of amount; can be extended for paired txs.
+  - transfer: move FIFO inventory from source wallet to destination wallet, preserving original Time, UnitCost, TotalCost (no gain).
+- Filtering:
+  - Transactions are filtered before processing when -wallet and/or -commodity are provided so only matching tx are processed.
+  - Verbose listing prints only transactions that match the CLI filters.
+  - Verbose transaction-level logs during processing are only printed for tx matching the filters.
+
+## Precision, rounding and reporting
+- All internal calculations (amounts, costs, fees, gains, income) use decimal.Decimal to preserve exact decimal arithmetic.
+- Only round and format to two decimal places at the final report output stage.
+  - Use fixed two-decimal formatting for printed summaries (e.g., StringFixed(2) or equivalent).
+- Avoid intermediate rounding; accumulate exact totals using decimal.
+
+## Output
+- Print per-year summaries (all years or filtered year) of per-wallet per-commodity:
+  - short gain, long gain, income.
+- Format:
+  Year YYYY:
+    Wallet: <name>
+      <COMMODITY>: short=<0.2f> long=<0.2f> income=<0.2f>
+
+## Error handling & behavior
+- Parsing errors for individual rows are logged (when verbose) and skipped; file-level errors abort with fatal.
+- If selling more than available inventory, the implementation warns (verbose) and leaves negative/short handling to future work.
+
+## Known limitations and recommended improvements (actionable)
+- Income valuation (important):
+  - Current behavior: income (rewards/staking) uses tx.Cost if present. Many exchange "earn"/"reward" rows lack a fiat cost/price, so income is recorded as 0.
+  - Recommendation: implement historical price resolution for reward timestamps:
+    - Preferred: accept a price-history CSV (or API) input mapping (asset, timestamp) -> fiat price and use it to set tx.Cost during parsing.
+    - Alternative: heuristics to find nearest trade in the same CSV/group and use its implied fiat price as a fallback.
+  - Without price lookup, income numbers will be incomplete/zero for reward-only rows.
+- Wallet name normalization/mapping:
+  - Provide a mapping file or flag to normalize wallet names (e.g., "spot / main" vs "Spot/Main") to avoid missed filters.
+- Format coverage:
+  - Current code implements Kraken + generic fallback. Add dedicated parsers for other exchanges (Binance, Coinbase, Trade Republic) with example CSVs.
+- Transfers & internal moves:
+  - Current synthesized "transfer" detection works for autoallocation/allocation subtypes; other patterns may require more heuristics.
+- Tests & CI:
+  - Add unit tests for parsing groups, transfer handling, FIFO gain computation, decimal behavior and the reward pricing fallback.
+- Documentation:
+  - Document the expected CSV header names supported and examples for each exchange format.
+- CLI: add option for price history source:
+  - e.g. -pricefile prices.csv (CSV with columns asset, timestamp, price, currency)
+  - or -priceapi <provider> with credentials
+
+## Acceptance criteria
+- Running the program with test CSVs produces plausible per-wallet per-commodity gains and income (subject to price-data availability for income).
+- All monetary/amount calculations are performed with decimal.Decimal and reported rounded to two decimal places in the final summary.
+- Transfers do not create spurious gains; income entries use available fiat-cost info when present.
+- Verbose mode prints only transactions that match wallet/commodity filters and lists the set of tx that will be processed.
+
+## Future work (non-blocking)
+- Improve automatic price lookup (public APIs or bundled price CSV).
+- Add export formats (CSV/JSON) of the computed tax events.
+- Add CLI to persist/inspect inventories and per-wallet snapshots.
+
+# End of requirements (updated)
